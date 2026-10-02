@@ -49,7 +49,7 @@ function pickWechatBodyProseMirrorCandidate(nodes, { titleInput, titleEditor } =
 
 // 微信公众号内容填充函数（在页面主世界中执行）
 // 注意：需要先调用 injectUtils 注入 window.waitFor
-async function fillWechatContent(title, htmlBody) {
+async function fillWechatContent(title, htmlBody, desc, thumb) {
   /**
    * 后台改版后可能存在多个 `.ProseMirror`（标题区也可能是 ProseMirror），
    * `querySelector('.ProseMirror')` 常会命中标题编辑器，导致正文 HTML 被贴进标题。
@@ -96,6 +96,22 @@ async function fillWechatContent(title, htmlBody) {
     const titleInput = document.querySelector('#title')
     const titleEditor = document.querySelector('.title-editor__input .ProseMirror')
     return pickCandidate(nodes, { titleInput, titleEditor })
+  }
+
+  /**
+   * 封面由微信自己按 URL 取图，取完会画进封面预览节点（.js_cover_preview_new），
+   * 这是唯一能判断封面是否真的生效的地方。
+   */
+  async function waitForCoverApplied(timeout = 4000) {
+    const start = Date.now()
+    while (Date.now() - start < timeout) {
+      const painted = [...document.querySelectorAll('.js_cover_preview_new, .js_cover_preview_square')].some(
+        el => /url\(\s*["']?[^"')\s]+/.test(el.getAttribute('style') || '')
+      )
+      if (painted) return true
+      await new Promise(r => setTimeout(r, 200))
+    }
+    return false
   }
 
   async function waitForBodyEditor(timeout = 15000) {
@@ -222,11 +238,45 @@ async function fillWechatContent(title, htmlBody) {
       const imageCount = editor.querySelectorAll?.('img').length || 0
       const hasEditorContent = wordCount > 0 || imageCount > 0 || injected
 
+      // 摘要：设置面板里的 textarea 由框架接管，走原型 setter 才能不被下一次重渲染还原。
+      let descFilled = false
+      if (desc) {
+        const descField = await window.waitFor('#js_description', 5000)
+        if (descField) {
+          const descSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+          if (descSetter) descSetter.call(descField, desc)
+          else descField.value = desc
+          descField.dispatchEvent(new Event('input', { bubbles: true }))
+          descField.dispatchEvent(new Event('change', { bubbles: true }))
+          descFilled = descField.value === desc
+          console.log('[COSE] 微信摘要已填充:', descFilled)
+        }
+      }
+
+      // 封面：官方 JSAPI（mp_editor_change_cover），图片用正文里已经上传好的地址，
+      // 微信自己去取。等它画出来再返回，否则紧接着的保存草稿会漏掉封面。
+      let coverApplied = false
+      if (thumb && window.__MP_Editor_JSAPI__ && typeof window.__MP_Editor_JSAPI__.invoke === 'function') {
+        try {
+          window.__MP_Editor_JSAPI__.invoke({
+            apiName: 'mp_editor_change_cover',
+            apiParam: { oriImgUrl: String(thumb).replace(/^http:/, 'https:') },
+            sucCb: res => console.log('[COSE] 微信封面已设置:', res),
+            errCb: err => console.warn('[COSE] 微信封面设置失败:', err),
+          })
+          coverApplied = await waitForCoverApplied()
+        } catch (err) {
+          console.warn('[COSE] 微信封面设置异常:', err && err.message ? err.message : err)
+        }
+      }
+
       return {
         success: hasEditorContent,
         error: hasEditorContent ? undefined : injectError || '正文注入后未检测到有效内容',
         wordCount,
         imageCount,
+        descFilled,
+        coverApplied,
         titleFilled: titleInput?.value === title || titleEditor?.textContent?.trim() === title,
       }
     }
@@ -376,7 +426,7 @@ async function syncWechatContent(tab, content, helpers) {
     result = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: fillWechatContent,
-      args: [content.title, htmlContent],
+      args: [content.title, htmlContent, content.desc || '', content.thumb || ''],
       world: 'MAIN',
     })
   } catch (e) {
